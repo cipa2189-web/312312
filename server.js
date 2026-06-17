@@ -276,6 +276,7 @@ io.on('connection', (socket) => {
     const kind = String(payload?.kind || '').trim(); // image | audio
     const mime = String(payload?.mime || '').trim();
     const data = String(payload?.data || '');
+    const id = String(payload?.id || `${Date.now()}-${Math.random()}`);
 
     if (!['image', 'audio'].includes(kind)) {
       return callback && callback({ ok: false, error: 'Неверный тип файла' });
@@ -285,6 +286,7 @@ io.on('connection', (socket) => {
     }
 
     const message = {
+      id,
       type: 'media',
       chatMode,
       from,

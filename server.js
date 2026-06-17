@@ -12,15 +12,16 @@ const io = new Server(server, {
 const users = new Map();
 // socket.id -> username
 const sockets = new Map();
-// список общих чатов/комнат
-const rooms = new Set(['Общий']);
+
+// groupName -> { name, owner, members: Set<string> }
+const groups = new Map();
 
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'simple-messenger',
     usersOnline: users.size,
-    rooms: Array.from(rooms).sort()
+    groups: Array.from(groups.keys()).sort()
   });
 });
 
@@ -28,20 +29,40 @@ function userList() {
   return Array.from(users.keys()).sort();
 }
 
-function roomList() {
-  return Array.from(rooms).sort();
+function groupsForUser(username) {
+  return Array.from(groups.values())
+    .filter(group => group.members.has(username))
+    .map(group => ({
+      name: group.name,
+      owner: group.owner,
+      members: Array.from(group.members).sort()
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function isValidName(value) {
+  return /^[a-zA-Zа-яА-ЯёЁ0-9_\-. ]+$/.test(value);
 }
 
 function broadcastUsers() {
   io.emit('users', userList());
 }
 
-function broadcastRooms() {
-  io.emit('rooms', roomList());
+function emitGroupsTo(username) {
+  const socketId = users.get(username);
+  if (socketId) {
+    io.to(socketId).emit('groups', groupsForUser(username));
+  }
 }
 
-function isValidName(value) {
-  return /^[a-zA-Zа-яА-ЯёЁ0-9_\-. ]+$/.test(value);
+function broadcastGroupsToAllOnline() {
+  for (const username of users.keys()) emitGroupsTo(username);
+}
+
+function joinUserToGroupRoom(username, groupName) {
+  const socketId = users.get(username);
+  const socket = socketId ? io.sockets.sockets.get(socketId) : null;
+  if (socket) socket.join('group:' + groupName);
 }
 
 io.on('connection', (socket) => {
@@ -64,51 +85,92 @@ io.on('connection', (socket) => {
     sockets.set(socket.id, username);
     socket.data.username = username;
 
-    // Автоматически подключаем ко всем существующим общим чатам.
-    for (const room of rooms) socket.join('room:' + room);
+    // Подключаем пользователя к комнатам его групп.
+    for (const group of groups.values()) {
+      if (group.members.has(username)) socket.join('group:' + group.name);
+    }
 
-    callback && callback({ ok: true, username, users: userList(), rooms: roomList() });
+    callback && callback({
+      ok: true,
+      username,
+      users: userList(),
+      groups: groupsForUser(username)
+    });
+
     broadcastUsers();
-    socket.emit('rooms', roomList());
+    emitGroupsTo(username);
     console.log('login', username);
   });
 
-  socket.on('create_room', (rawRoom, callback) => {
+  socket.on('create_group', (rawName, callback) => {
     const username = socket.data.username;
     if (!username) {
       return callback && callback({ ok: false, error: 'Сначала выполните вход' });
     }
 
-    const room = String(rawRoom || '').trim();
-    if (!room || room.length < 2 || room.length > 30) {
-      return callback && callback({ ok: false, error: 'Название чата должно быть от 2 до 30 символов' });
+    const name = String(rawName || '').trim();
+    if (!name || name.length < 2 || name.length > 30) {
+      return callback && callback({ ok: false, error: 'Название группы должно быть от 2 до 30 символов' });
     }
-    if (!isValidName(room)) {
+    if (!isValidName(name)) {
       return callback && callback({ ok: false, error: 'Можно использовать буквы, цифры, _, -, . и пробел' });
     }
-
-    rooms.add(room);
-    for (const [, socketId] of users) {
-      io.sockets.sockets.get(socketId)?.join('room:' + room);
+    if (groups.has(name)) {
+      return callback && callback({ ok: false, error: 'Такая группа уже есть' });
     }
 
-    broadcastRooms();
-    callback && callback({ ok: true, room });
+    groups.set(name, {
+      name,
+      owner: username,
+      members: new Set([username])
+    });
+
+    socket.join('group:' + name);
+    emitGroupsTo(username);
+    callback && callback({ ok: true, group: name });
+    console.log('create_group', name, 'owner', username);
   });
 
-  socket.on('join_room', (rawRoom, callback) => {
+  socket.on('add_user_to_group', (payload, callback) => {
     const username = socket.data.username;
     if (!username) {
       return callback && callback({ ok: false, error: 'Сначала выполните вход' });
     }
 
-    const room = String(rawRoom || '').trim();
-    if (!rooms.has(room)) {
-      return callback && callback({ ok: false, error: 'Такого общего чата нет' });
+    const groupName = String(payload?.group || '').trim();
+    const userToAdd = String(payload?.user || '').trim();
+    const group = groups.get(groupName);
+
+    if (!group) {
+      return callback && callback({ ok: false, error: 'Такой группы нет' });
+    }
+    if (!group.members.has(username)) {
+      return callback && callback({ ok: false, error: 'Вы не участник этой группы' });
+    }
+    if (!users.has(userToAdd)) {
+      return callback && callback({ ok: false, error: 'Пользователь не онлайн' });
+    }
+    if (group.members.has(userToAdd)) {
+      return callback && callback({ ok: false, error: 'Пользователь уже в группе' });
     }
 
-    socket.join('room:' + room);
-    callback && callback({ ok: true, room });
+    group.members.add(userToAdd);
+    joinUserToGroupRoom(userToAdd, groupName);
+
+    emitGroupsTo(userToAdd);
+    emitGroupsTo(username);
+
+    const systemMessage = {
+      type: 'group',
+      group: groupName,
+      from: 'Система',
+      text: `${username} добавил ${userToAdd} в группу`,
+      time: Date.now()
+    };
+    io.to('group:' + groupName).emit('group_message', systemMessage);
+
+    callback && callback({ ok: true, group: groupName, user: userToAdd });
+    console.log('add_user_to_group', userToAdd, 'to', groupName, 'by', username);
   });
 
   socket.on('private_message', (payload, callback) => {
@@ -134,24 +196,28 @@ io.on('connection', (socket) => {
     callback && callback({ ok: true });
   });
 
-  socket.on('room_message', (payload, callback) => {
+  socket.on('group_message', (payload, callback) => {
     const from = socket.data.username;
     if (!from) {
       return callback && callback({ ok: false, error: 'Сначала выполните вход' });
     }
 
-    const room = String(payload?.room || '').trim();
+    const groupName = String(payload?.group || '').trim();
     const text = String(payload?.text || '').trim();
+    const group = groups.get(groupName);
 
-    if (!room || !rooms.has(room)) {
-      return callback && callback({ ok: false, error: 'Такого общего чата нет' });
+    if (!group) {
+      return callback && callback({ ok: false, error: 'Такой группы нет' });
+    }
+    if (!group.members.has(from)) {
+      return callback && callback({ ok: false, error: 'Вы не участник этой группы' });
     }
     if (!text || text.length > 1000) {
       return callback && callback({ ok: false, error: 'Сообщение пустое или слишком длинное' });
     }
 
-    const message = { type: 'room', room, from, text, time: Date.now() };
-    io.to('room:' + room).emit('room_message', message);
+    const message = { type: 'group', group: groupName, from, text, time: Date.now() };
+    io.to('group:' + groupName).emit('group_message', message);
     callback && callback({ ok: true });
   });
 
@@ -161,6 +227,7 @@ io.on('connection', (socket) => {
       users.delete(username);
       sockets.delete(socket.id);
       broadcastUsers();
+      broadcastGroupsToAllOnline();
       console.log('logout', username);
     }
     console.log('disconnected', socket.id);

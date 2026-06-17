@@ -13,7 +13,7 @@ const users = new Map();
 // socket.id -> username
 const sockets = new Map();
 
-// groupName -> { name, owner, members: Set<string> }
+// groupName -> { name, owner, admins: Set<string>, members: Set<string> }
 const groups = new Map();
 
 app.get('/', (req, res) => {
@@ -35,6 +35,7 @@ function groupsForUser(username) {
     .map(group => ({
       name: group.name,
       owner: group.owner,
+      admins: Array.from(group.admins || new Set([group.owner])).sort(),
       members: Array.from(group.members).sort()
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -63,6 +64,22 @@ function joinUserToGroupRoom(username, groupName) {
   const socketId = users.get(username);
   const socket = socketId ? io.sockets.sockets.get(socketId) : null;
   if (socket) socket.join('group:' + groupName);
+}
+
+
+function isGroupOwner(group, username) {
+  return group && group.owner === username;
+}
+
+function sendGroupSystemMessage(groupName, text) {
+  const systemMessage = {
+    type: 'group',
+    group: groupName,
+    from: 'Система',
+    text,
+    time: Date.now()
+  };
+  io.to('group:' + groupName).emit('group_message', systemMessage);
 }
 
 io.on('connection', (socket) => {
@@ -122,6 +139,7 @@ io.on('connection', (socket) => {
     groups.set(name, {
       name,
       owner: username,
+      admins: new Set([username]),
       members: new Set([username])
     });
 
@@ -144,8 +162,8 @@ io.on('connection', (socket) => {
     if (!group) {
       return callback && callback({ ok: false, error: 'Такой группы нет' });
     }
-    if (!group.members.has(username)) {
-      return callback && callback({ ok: false, error: 'Вы не участник этой группы' });
+    if (!isGroupOwner(group, username)) {
+      return callback && callback({ ok: false, error: 'Добавлять людей может только создатель группы' });
     }
     if (!users.has(userToAdd)) {
       return callback && callback({ ok: false, error: 'Пользователь не онлайн' });
@@ -160,17 +178,91 @@ io.on('connection', (socket) => {
     emitGroupsTo(userToAdd);
     emitGroupsTo(username);
 
-    const systemMessage = {
-      type: 'group',
-      group: groupName,
-      from: 'Система',
-      text: `${username} добавил ${userToAdd} в группу`,
-      time: Date.now()
-    };
-    io.to('group:' + groupName).emit('group_message', systemMessage);
+    sendGroupSystemMessage(groupName, `${username} добавил ${userToAdd} в группу`);
 
     callback && callback({ ok: true, group: groupName, user: userToAdd });
     console.log('add_user_to_group', userToAdd, 'to', groupName, 'by', username);
+  });
+
+  socket.on('leave_group', (payload, callback) => {
+    const username = socket.data.username;
+    if (!username) return callback && callback({ ok: false, error: 'Сначала выполните вход' });
+
+    const groupName = String(payload?.group || '').trim();
+    const group = groups.get(groupName);
+    if (!group) return callback && callback({ ok: false, error: 'Такой группы нет' });
+    if (!group.members.has(username)) return callback && callback({ ok: false, error: 'Вы не участник группы' });
+    if (group.owner === username) return callback && callback({ ok: false, error: 'Создатель не может выйти. Можно удалить группу.' });
+
+    group.members.delete(username);
+    group.admins && group.admins.delete(username);
+    socket.leave('group:' + groupName);
+    emitGroupsTo(username);
+    for (const member of group.members) emitGroupsTo(member);
+    sendGroupSystemMessage(groupName, `${username} вышел из группы`);
+    callback && callback({ ok: true });
+  });
+
+  socket.on('delete_group', (payload, callback) => {
+    const username = socket.data.username;
+    if (!username) return callback && callback({ ok: false, error: 'Сначала выполните вход' });
+
+    const groupName = String(payload?.group || '').trim();
+    const group = groups.get(groupName);
+    if (!group) return callback && callback({ ok: false, error: 'Такой группы нет' });
+    if (!isGroupOwner(group, username)) return callback && callback({ ok: false, error: 'Удалить группу может только создатель' });
+
+    const members = Array.from(group.members);
+    io.to('group:' + groupName).emit('group_deleted', { group: groupName });
+    groups.delete(groupName);
+    for (const member of members) emitGroupsTo(member);
+    callback && callback({ ok: true });
+  });
+
+  socket.on('remove_user_from_group', (payload, callback) => {
+    const username = socket.data.username;
+    if (!username) return callback && callback({ ok: false, error: 'Сначала выполните вход' });
+
+    const groupName = String(payload?.group || '').trim();
+    const userToRemove = String(payload?.user || '').trim();
+    const group = groups.get(groupName);
+    if (!group) return callback && callback({ ok: false, error: 'Такой группы нет' });
+    if (!isGroupOwner(group, username)) return callback && callback({ ok: false, error: 'Удалять участников может только создатель' });
+    if (userToRemove === group.owner) return callback && callback({ ok: false, error: 'Нельзя удалить создателя группы' });
+    if (!group.members.has(userToRemove)) return callback && callback({ ok: false, error: 'Пользователь не в группе' });
+
+    group.members.delete(userToRemove);
+    group.admins && group.admins.delete(userToRemove);
+    const socketId = users.get(userToRemove);
+    const targetSocket = socketId ? io.sockets.sockets.get(socketId) : null;
+    if (targetSocket) targetSocket.leave('group:' + groupName);
+
+    emitGroupsTo(userToRemove);
+    for (const member of group.members) emitGroupsTo(member);
+    sendGroupSystemMessage(groupName, `${username} удалил ${userToRemove} из группы`);
+    callback && callback({ ok: true });
+  });
+
+  socket.on('set_group_admin', (payload, callback) => {
+    const username = socket.data.username;
+    if (!username) return callback && callback({ ok: false, error: 'Сначала выполните вход' });
+
+    const groupName = String(payload?.group || '').trim();
+    const targetUser = String(payload?.user || '').trim();
+    const isAdmin = payload?.admin !== false;
+    const group = groups.get(groupName);
+    if (!group) return callback && callback({ ok: false, error: 'Такой группы нет' });
+    if (!isGroupOwner(group, username)) return callback && callback({ ok: false, error: 'Назначать админов может только создатель' });
+    if (!group.members.has(targetUser)) return callback && callback({ ok: false, error: 'Пользователь не в группе' });
+    if (targetUser === group.owner && !isAdmin) return callback && callback({ ok: false, error: 'Создатель всегда админ' });
+
+    if (!group.admins) group.admins = new Set([group.owner]);
+    if (isAdmin) group.admins.add(targetUser);
+    else group.admins.delete(targetUser);
+
+    for (const member of group.members) emitGroupsTo(member);
+    sendGroupSystemMessage(groupName, isAdmin ? `${targetUser} теперь администратор` : `${targetUser} больше не администратор`);
+    callback && callback({ ok: true });
   });
 
   socket.on('private_message', (payload, callback) => {

@@ -5,7 +5,8 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: { origin: '*' },
+  maxHttpBufferSize: 10 * 1024 * 1024
 });
 
 // username -> socket.id
@@ -263,6 +264,54 @@ io.on('connection', (socket) => {
     for (const member of group.members) emitGroupsTo(member);
     sendGroupSystemMessage(groupName, isAdmin ? `${targetUser} теперь администратор` : `${targetUser} больше не администратор`);
     callback && callback({ ok: true });
+  });
+
+  socket.on('media_message', (payload, callback) => {
+    const from = socket.data.username;
+    if (!from) return callback && callback({ ok: false, error: 'Сначала выполните вход' });
+
+    const chatMode = String(payload?.chatMode || '').trim(); // private | group
+    const to = String(payload?.to || '').trim();
+    const groupName = String(payload?.group || '').trim();
+    const kind = String(payload?.kind || '').trim(); // image | audio
+    const mime = String(payload?.mime || '').trim();
+    const data = String(payload?.data || '');
+
+    if (!['image', 'audio'].includes(kind)) {
+      return callback && callback({ ok: false, error: 'Неверный тип файла' });
+    }
+    if (!data || data.length > 8 * 1024 * 1024) {
+      return callback && callback({ ok: false, error: 'Файл пустой или слишком большой' });
+    }
+
+    const message = {
+      type: 'media',
+      chatMode,
+      from,
+      to: chatMode === 'private' ? to : undefined,
+      group: chatMode === 'group' ? groupName : undefined,
+      kind,
+      mime,
+      data,
+      time: Date.now()
+    };
+
+    if (chatMode === 'private') {
+      if (!to || !users.has(to)) return callback && callback({ ok: false, error: 'Получатель не онлайн' });
+      io.to(users.get(to)).emit('media_message', message);
+      socket.emit('media_message', message);
+      return callback && callback({ ok: true });
+    }
+
+    if (chatMode === 'group') {
+      const group = groups.get(groupName);
+      if (!group) return callback && callback({ ok: false, error: 'Такой группы нет' });
+      if (!group.members.has(from)) return callback && callback({ ok: false, error: 'Вы не участник этой группы' });
+      io.to('group:' + groupName).emit('media_message', message);
+      return callback && callback({ ok: true });
+    }
+
+    return callback && callback({ ok: false, error: 'Выберите чат' });
   });
 
   socket.on('private_message', (payload, callback) => {

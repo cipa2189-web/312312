@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: simple-private-messenger
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
